@@ -1,6 +1,6 @@
 'use strict'
 
-const { app, BrowserWindow, Menu, Tray, nativeImage, screen } = require('electron')
+const { app, BrowserWindow, Menu, Tray, nativeImage, screen, ipcMain } = require('electron')
 const path = require('path')
 const { spawn } = require('child_process')
 const net = require('net')
@@ -132,6 +132,23 @@ function createTray() {
     Menu.buildFromTemplate([{ label: 'Quit Claude Listener', click: () => app.quit() }])
   )
 }
+
+// ── dashboard IPC ─────────────────────────────────────────────────────────────
+
+const DOT_W = 80, DOT_H = 80, DASH_W = 400, DASH_H = 520
+
+ipcMain.on('toggle-dashboard', (_event, open) => {
+  if (!win) return
+  const { width, height } = screen.getPrimaryDisplay().workAreaSize
+  // keep the bottom-right corner of the window anchored
+  const anchorRight  = width  - 32
+  const anchorBottom = height - 32
+  if (open) {
+    win.setBounds({ x: anchorRight - DASH_W, y: anchorBottom - DASH_H, width: DASH_W, height: DASH_H })
+  } else {
+    win.setBounds({ x: anchorRight - DOT_W, y: anchorBottom - DOT_H, width: DOT_W, height: DOT_H })
+  }
+})
 
 // ── lifecycle ─────────────────────────────────────────────────────────────────
 

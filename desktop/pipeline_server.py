@@ -39,17 +39,33 @@ _TOOLS = [
 ]
 
 
-async def _broadcast(state: str) -> None:
+async def _broadcast(payload: dict) -> None:
     if not _clients:
         return
-    msg = json.dumps({"state": state})
+    msg = json.dumps(payload)
     await asyncio.gather(*[c.send(msg) for c in list(_clients)], return_exceptions=True)
+
+
+async def _broadcast_state(state: str) -> None:
+    await _broadcast({"type": "state", "state": state})
+
+
+async def _broadcast_log(level: str, text: str) -> None:
+    await _broadcast({"type": "log", "ts": time.time(), "level": level, "text": text})
 
 
 async def _ws_handler(ws: ServerConnection) -> None:
     _clients.add(ws)
     print(f"[ws] client connected ({len(_clients)})")
     try:
+        await ws.send(json.dumps({
+            "type": "config",
+            "working_dir": str(Config.WORKING_DIR),
+            "session_window": SESSION_WINDOW,
+            "energy_threshold": ENERGY_THRESHOLD,
+            "wake_phrases": list(WAKE_PHRASES),
+            "ws_port": WS_PORT,
+        }))
         await ws.wait_closed()
     finally:
         _clients.discard(ws)
@@ -86,15 +102,17 @@ class Pipeline:
         claude = AsyncAnthropic(api_key=ak)
 
         while self._running:
-            await _broadcast("standby")
+            await _broadcast_state("standby")
             self._stop_ev.clear()
 
-            audio = await asyncio.get_event_loop().run_in_executor(None, self._capture)
+            audio = await asyncio.get_running_loop().run_in_executor(None, self._capture)
             if audio is None or len(audio) < SAMPLE_RATE * 0.25:
                 continue
 
-            await _broadcast("processing")
-            print(f"[pipeline] captured {len(audio)/SAMPLE_RATE:.1f}s → transcribing...")
+            await _broadcast_state("processing")
+            dur = len(audio) / SAMPLE_RATE
+            print(f"[pipeline] captured {dur:.1f}s → transcribing...")
+            await _broadcast_log("info", f"captured {dur:.1f}s — transcribing…")
             transcript = await self._stt(openai, audio)
             print(f"[pipeline] transcript: {transcript!r}")
             if not transcript:
@@ -106,17 +124,19 @@ class Pipeline:
             elif time.monotonic() - self._last_activation > SESSION_WINDOW:
                 continue
 
-            await _broadcast("listening")
+            await _broadcast_log("transcript", transcript)
+            await _broadcast_state("listening")
             command = _extract_command(transcript)
             await asyncio.sleep(0.08)
 
-            await _broadcast("processing")
+            await _broadcast_state("processing")
             response = await self._ask_claude(claude, command)
             print(f"[pipeline] response: {response!r}")
 
             if response:
-                await _broadcast("speaking")
-                await asyncio.get_event_loop().run_in_executor(
+                await _broadcast_log("response", response)
+                await _broadcast_state("speaking")
+                await asyncio.get_running_loop().run_in_executor(
                     None, self._speak_sync, openai, response
                 )
 
@@ -238,6 +258,17 @@ class Pipeline:
 
 
 async def _main() -> None:
+    loop = asyncio.get_event_loop()
+    _original_exc_handler = loop.get_exception_handler()
+
+    def _exc_handler(lp, ctx):
+        exc = ctx.get("exception")
+        if isinstance(exc, (EOFError, OSError)):
+            return  # benign: browser/Vite HTTP probe on the WS port
+        (_original_exc_handler or lp.default_exception_handler)(ctx)
+
+    loop.set_exception_handler(_exc_handler)
+
     pipeline = Pipeline()
     async with ws_serve(_ws_handler, "localhost", WS_PORT):
         print(f"[ws] server ready on ws://localhost:{WS_PORT}")
