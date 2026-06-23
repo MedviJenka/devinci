@@ -28,7 +28,13 @@ _clients: set[ServerConnection] = set()
 
 _SYSTEM = """You are a voice coding assistant. Keep all responses to 1-2 short spoken sentences.
 No markdown, no code blocks. When you write or edit a file say "Done, I wrote [what] to [file]".
-Be direct and concise."""
+Be direct and concise.
+
+Decision rule — choose ONE path per command:
+• Simple (read file, run tests, quick single-file edit, any question): handle directly with tools.
+• Complex (refactor, add feature, multi-file change, create module, write tests for a whole module):
+  call delegate_to_crew with a full task description, then say exactly:
+  "On it — I've handed that to the crew, I'll let you know when it's done." """
 
 _TOOLS = [
     {"name": "read_file",      "description": "Read a file.",               "input_schema": {"type": "object", "properties": {"path": {"type": "string"}},                                                    "required": ["path"]}},
@@ -36,6 +42,21 @@ _TOOLS = [
     {"name": "list_directory", "description": "List directory contents.",   "input_schema": {"type": "object", "properties": {"path": {"type": "string", "default": "."}}}},
     {"name": "search_code",    "description": "Search files for pattern.",  "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}, "glob": {"type": "string", "default": "**/*.py"}}, "required": ["pattern"]}},
     {"name": "run_command",    "description": "Run a shell command.",        "input_schema": {"type": "object", "properties": {"command": {"type": "string"}},                                                 "required": ["command"]}},
+    {
+        "name": "delegate_to_crew",
+        "description": (
+            "Hand a complex multi-step coding task to a specialist AI crew (Planner + Developer). "
+            "Use for: refactoring, adding features, creating modules, multi-file fixes, writing test suites. "
+            "Do NOT use for simple lookups, single commands, or quick single-file edits."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "Complete description of the task to implement."}
+            },
+            "required": ["task"],
+        },
+    },
 ]
 
 
@@ -98,6 +119,7 @@ class Pipeline:
         print(f"[pipeline] WebSocket     : ws://localhost:{WS_PORT}")
         print("[pipeline] Listening for microphone...")
 
+        self._ok = ok                          # stored so _run_crew can build clients
         openai = AsyncOpenAI(api_key=ok)
         claude = AsyncAnthropic(api_key=ak)
 
@@ -203,13 +225,52 @@ class Pipeline:
                 return next((b.text for b in resp.content if hasattr(b, "text")), "")
 
             results = []
+            crew_task: str | None = None
             for block in resp.content:
                 if block.type == "tool_use":
-                    results.append({"type": "tool_result", "tool_use_id": block.id,
-                                    "content": self._run_tool(block.name, block.input)})
+                    if block.name == "delegate_to_crew":
+                        crew_task = block.input.get("task", "")
+                        results.append({"type": "tool_result", "tool_use_id": block.id,
+                                        "content": "Crew task scheduled."})
+                    else:
+                        results.append({"type": "tool_result", "tool_use_id": block.id,
+                                        "content": self._run_tool(block.name, block.input)})
+
+            if crew_task:
+                asyncio.get_running_loop().create_task(self._run_crew(crew_task))
+
             messages += [{"role": "assistant", "content": resp.content},
                          {"role": "user",      "content": results}]
         return "Done."
+
+    async def _run_crew(self, task: str) -> None:
+        """Run a CrewAI crew in a thread, streaming progress via WebSocket logs."""
+        loop = asyncio.get_running_loop()
+        await _broadcast_log("info", f"[crew] starting — {task[:80]}")
+
+        def _crew_sync() -> str:
+            from desktop.crew_agent import make_crew
+
+            def _sync_log(level: str, text: str) -> None:
+                asyncio.run_coroutine_threadsafe(_broadcast_log(level, text), loop)
+
+            crew = make_crew(task, self._wd, _sync_log)
+            result = crew.kickoff()
+            return str(getattr(result, "raw", result)).strip()
+
+        def _speak(text: str) -> None:
+            from openai import AsyncOpenAI as _AO
+            self._speak_sync(_AO(api_key=self._ok), text)
+
+        try:
+            result = await loop.run_in_executor(None, _crew_sync)
+            summary = result[:220] if result else "task complete"
+            await _broadcast_log("response", f"[crew] done — {summary}")
+            await loop.run_in_executor(None, _speak, f"Done. {summary}")
+        except Exception as exc:
+            msg = str(exc)[:120]
+            await _broadcast_log("error", f"[crew] failed — {msg}")
+            await loop.run_in_executor(None, _speak, "The crew ran into a problem — check the logs.")
 
     def _run_tool(self, name: str, args: dict) -> str:
         try:
